@@ -66,6 +66,8 @@ if(WIN32)
   endif()
 endif()
 option(DISABLE_BORINGSSL_ASM "Disable BoringSSL asm (arm64 workaround)" ${_disable_boringssl_asm_default})
+option(DISABLE_ZSTD_ASM "Disable zstd inline assembly" OFF)
+option(BUILD_SHARED_LIBS "Build shared libcurl" ON)
 if(WIN32 OR APPLE OR ANDROID OR CMAKE_SYSTEM_NAME MATCHES "BSD$")
   set(_use_libidn2_default OFF)
 else()
@@ -79,6 +81,8 @@ set(CURL_IMPERSONATE_CXX_RUNTIME_LIBRARY "stdc++" CACHE STRING
   "C++ runtime library used to link static BoringSSL")
 set(CURL_CA_BUNDLE "" CACHE STRING "CA bundle for curl ('auto', 'none', or full path)")
 set(CURL_CA_PATH "" CACHE STRING "CA directory for curl ('auto', 'none', or full path)")
+set(BORINGSSL_PATCH "" CACHE FILEPATH "Optional additional patch to apply to BoringSSL")
+set(ZSTD_PATCH "" CACHE FILEPATH "Optional patch to apply to zstd")
 
 set(DEPS_SRC_DIR "${CMAKE_BINARY_DIR}/deps/src")
 set(DEPS_BUILD_DIR "${CMAKE_BINARY_DIR}/deps/build")
@@ -198,6 +202,10 @@ ExternalProject_Add(zlib
 )
 
 # zstd
+set(_zstd_patch_command ${CMAKE_COMMAND} -E true)
+if(ZSTD_PATCH)
+  set(_zstd_patch_command ${PATCH_EXE} --batch --forward -p1 -i "${ZSTD_PATCH}")
+endif()
 ExternalProject_Add(zstd
   URL "${ZSTD_URL}"
   URL_HASH "${ZSTD_URL_HASH}"
@@ -205,6 +213,7 @@ ExternalProject_Add(zstd
   BINARY_DIR "${DEPS_BUILD_DIR}/zstd"
   INSTALL_DIR "${DEPS_INSTALL_DIR}"
   SOURCE_SUBDIR build/cmake
+  PATCH_COMMAND ${_zstd_patch_command}
   CMAKE_ARGS
     ${_common_cmake_args}
     -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
@@ -213,6 +222,7 @@ ExternalProject_Add(zstd
     -DZSTD_BUILD_PROGRAMS=OFF
     -DZSTD_BUILD_CONTRIB=OFF
     -DZSTD_BUILD_TESTS=OFF
+    -DZSTD_DISABLE_ASM=${DISABLE_ZSTD_ASM}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --parallel ${SUBJOBS}
 )
 
@@ -262,12 +272,18 @@ endif()
 _track_external_project_patch(
   boringssl _boringssl_patch_file _boringssl_patch_changed
 )
+set(_boringssl_patch_command ${PATCH_EXE} -p1 -i "${_boringssl_patch_file}")
+if(BORINGSSL_PATCH)
+  list(APPEND _boringssl_patch_command
+    COMMAND ${PATCH_EXE} --batch --forward -p1 -i "${BORINGSSL_PATCH}"
+  )
+endif()
 ExternalProject_Add(boringssl
   URL "${BORINGSSL_URL}"
   URL_HASH "${BORINGSSL_URL_HASH}"
   SOURCE_DIR "${DEPS_SRC_DIR}/boringssl"
   BINARY_DIR "${DEPS_BUILD_DIR}/boringssl"
-  PATCH_COMMAND ${PATCH_EXE} -p1 -i "${_boringssl_patch_file}"
+  PATCH_COMMAND ${_boringssl_patch_command}
   CMAKE_ARGS ${_boringssl_cmake_args}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target ssl crypto --parallel ${SUBJOBS}
   INSTALL_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target install --parallel ${SUBJOBS}
@@ -416,9 +432,9 @@ else()
   set(_curl_idn_flags -DUSE_LIBIDN2=OFF)
 endif()
 
-# Single curl build mode: produce shared+static libcurl and static curl binary.
+# Produce static libcurl and a static curl binary, plus shared libcurl by default.
 set(_curl_build_flags
-  -DBUILD_SHARED_LIBS=ON
+  -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
   -DBUILD_STATIC_LIBS=ON
   -DBUILD_STATIC_CURL=ON
   -DBUILD_CURL_EXE=ON
