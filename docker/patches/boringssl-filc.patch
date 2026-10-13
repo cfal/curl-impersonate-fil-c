@@ -1,0 +1,48 @@
+From: curl-impersonate maintainers
+Subject: [PATCH] Use Fil-C-compatible BoringSSL fallbacks
+
+Fil-C rejects unknown madvise advice values instead of returning EINVAL.
+BoringSSL probes madvise with -1 before enabling MADV_WIPEONFORK, so skip that
+probe and report the optimization unavailable. BoringSSL then draws fresh OS
+entropy on each call, its documented safe fallback when fork detection is not
+available.
+
+BoringSSL's specialized P-256 method also passes pointers through integer
+words in generated Bedrock code, which discards Fil-C's pointer capabilities.
+Use BoringSSL's generic Montgomery method for P-256 under Fil-C, as it already
+does for curves without a compatible specialized method.
+
+--- a/crypto/fipsmodule/ec/ec.cc.inc
++++ b/crypto/fipsmodule/ec/ec.cc.inc
+@@ -99,7 +99,9 @@ DEFINE_METHOD_FUNCTION(EC_GROUP, EC_group_p256) {
+   ec_group_init_static_mont(&out->order, std::size(kP256Order), kP256Order,
+                             kP256OrderRR, kP256OrderN0);
+ 
+-#if !defined(OPENSSL_NO_ASM) &&                              \
++#if defined(__FILC__)
++  out->meth = EC_GFp_mont_method();
++#elif !defined(OPENSSL_NO_ASM) &&                           \
+     (defined(OPENSSL_X86_64) || defined(OPENSSL_AARCH64)) && \
+     !defined(OPENSSL_SMALL)
+   out->meth = EC_GFp_nistz256_method();
+
+--- a/crypto/rand/fork_detect.cc
++++ b/crypto/rand/fork_detect.cc
+@@ -57,6 +57,9 @@ using namespace bssl;
+ 
+ static bool wipeonfork(void *addr, size_t page_size) {
+ #if defined(OPENSSL_LINUX)
++#if defined(__FILC__)
++  return false;
++#else
+   // Linux flavor, >=4.14.
+   // Some versions of qemu (up to at least 5.0.0-rc4, see linux-user/syscall.c)
+   // ignore `madvise` calls and just return zero (i.e. success). But we need to
+@@ -66,6 +69,7 @@ static bool wipeonfork(void *addr, size_t page_size) {
+   // unknown `advice` values.
+   return madvise(addr, page_size, -1) != 0 &&
+          madvise(addr, page_size, MADV_WIPEONFORK) == 0;
++#endif
+ #elif defined(MAP_INHERIT_ZERO)
+   // OpenBSD flavor, >=5.6.
+   return minherit(addr, page_size, MAP_INHERIT_ZERO) == 0;

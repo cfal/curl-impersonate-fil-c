@@ -1,4 +1,4 @@
-name: Build and push docker images
+name: Build Fil-C images and artifacts
 
 on:
   push:
@@ -13,8 +13,14 @@ on:
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: read
+
 env:
   DOCKER_CLI_EXPERIMENTAL: enabled
+  DOCKER_IMAGE_OWNER: ${{ secrets.DOCKER_USERNAME || github.repository_owner }}
+  CAN_PUSH_IMAGE: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_TOKEN != '' }}
 
 jobs:
   build:
@@ -28,7 +34,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to DockerHub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.CAN_PUSH_IMAGE == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -38,7 +44,7 @@ jobs:
         id: check_tag
         run: |
           if [[ "${GITHUB_REF}" =~ ^refs/tags/v ]]; then
-            echo "push_image=true" >> $GITHUB_ENV
+            echo "push_image=${CAN_PUSH_IMAGE}" >> $GITHUB_ENV
             echo "image_tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
           else
             echo "push_image=false" >> $GITHUB_ENV
@@ -52,8 +58,8 @@ jobs:
           file: docker/debian.dockerfile
           push: ${{ env.push_image }}
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/curl-impersonate:${{ env.image_tag }}
-            ${{ secrets.DOCKER_USERNAME }}/curl-impersonate:latest
+            ${{ env.DOCKER_IMAGE_OWNER }}/curl-impersonate:${{ env.image_tag }}
+            ${{ env.DOCKER_IMAGE_OWNER }}/curl-impersonate:latest
 
       - name: Build alpine docker image
         uses: docker/build-push-action@v6
@@ -62,5 +68,76 @@ jobs:
           file: docker/alpine.dockerfile
           push: ${{ env.push_image }}
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/curl-impersonate:${{ env.image_tag }}-alpine
-            ${{ secrets.DOCKER_USERNAME }}/curl-impersonate:alpine
+            ${{ env.DOCKER_IMAGE_OWNER }}/curl-impersonate:${{ env.image_tag }}-alpine
+            ${{ env.DOCKER_IMAGE_OWNER }}/curl-impersonate:alpine
+
+      - name: Export Fil-C install tree
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/debian.dockerfile
+          target: artifact
+          outputs: type=local,dest=${{ runner.temp }}/filc-install
+
+      - name: Verify and package Fil-C artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${{ runner.temp }}/filc-install"
+          binary="${install_dir}/bin/curl-impersonate"
+          release_dir="${{ runner.temp }}/release-assets"
+
+          test -x "${binary}"
+          file "${binary}" > "${{ runner.temp }}/curl.file"
+          grep -Fq "static-pie linked" "${{ runner.temp }}/curl.file"
+          readelf -lW "${binary}" > "${{ runner.temp }}/curl.segments"
+          if grep -Fq " INTERP " "${{ runner.temp }}/curl.segments"; then
+            echo "Fil-C artifact unexpectedly has an ELF interpreter" >&2
+            exit 1
+          fi
+          nm -a "${binary}" > "${{ runner.temp }}/curl.nm"
+          grep -Eq '[[:space:]][Tt][[:space:]]+filc_' "${{ runner.temp }}/curl.nm"
+          grep -m 20 -E '[[:space:]][Tt][[:space:]]+filc_' "${{ runner.temp }}/curl.nm"
+          "${binary}" --version
+          "${binary}" --fail --silent --show-error --retry 3 \
+            --retry-all-errors --connect-timeout 20 --output /dev/null \
+            https://github.com/
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            artifact_version="${GITHUB_REF_NAME}"
+          else
+            artifact_version="${GITHUB_SHA}"
+          fi
+          archive="curl-impersonate-${artifact_version}.x86_64-linux-filc.tar.gz"
+          mkdir -p "${release_dir}"
+          tar -C "${install_dir}" -czf "${release_dir}/${archive}" .
+          cd "${release_dir}"
+          sha256sum "${archive}" > "${archive}.sha256"
+
+      - name: Upload Fil-C artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: curl-impersonate-fil-c-${{ github.sha }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Fil-C release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Fil-C artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: curl-impersonate-fil-c-${{ github.sha }}
+          path: ${{ runner.temp }}/release-assets
+
+      - name: Publish Fil-C release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ runner.temp }}/release-assets/*
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
+          draft: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
